@@ -1,7 +1,6 @@
-// server.js
-import express from 'express';
-import cors from 'cors';
-import { pipeline, cos_sim } from '@xenova/transformers';
+const express = require('express');
+const cors = require('cors');
+const use = require('@tensorflow-models/universal-sentence-encoder');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -10,161 +9,175 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Cache the model
-let extractor = null;
+// Global variable to store the loaded model
+let model = null;
+let modelLoadingPromise = null;
 
-async function getExtractor() {
-  if (!extractor) {
-    console.log('Loading model...');
-    extractor = await pipeline(
-      'feature-extraction',
-      'Xenova/all-MiniLM-L6-v2',
-      { quantized: true }
-    );
-    console.log('Model loaded!');
+// Function to load the model
+async function loadModel() {
+  if (model) {
+    return model;
   }
-  return extractor;
+  
+  if (modelLoadingPromise) {
+    return modelLoadingPromise;
+  }
+  
+  console.log('Loading Universal Sentence Encoder model...');
+  modelLoadingPromise = use.load();
+  
+  try {
+    model = await modelLoadingPromise;
+    console.log('Model loaded successfully!');
+    return model;
+  } catch (error) {
+    console.error('Error loading model:', error);
+    modelLoadingPromise = null;
+    throw error;
+  }
 }
 
-// Jaro-Winkler similarity
-function jaroWinkler(s1, s2) {
-  const m = s1.length;
-  const n = s2.length;
-  
-  if (m === 0 && n === 0) return 1.0;
-  if (m === 0 || n === 0) return 0.0;
-  
-  const matchWindow = Math.floor(Math.max(m, n) / 2) - 1;
-  const s1Matches = new Array(m).fill(false);
-  const s2Matches = new Array(n).fill(false);
-  
-  let matches = 0;
-  let transpositions = 0;
-  
-  for (let i = 0; i < m; i++) {
-    const start = Math.max(0, i - matchWindow);
-    const end = Math.min(i + matchWindow + 1, n);
-    
-    for (let j = start; j < end; j++) {
-      if (s2Matches[j] || s1[i] !== s2[j]) continue;
-      s1Matches[i] = true;
-      s2Matches[j] = true;
-      matches++;
-      break;
-    }
-  }
-  
-  if (matches === 0) return 0.0;
-  
-  let k = 0;
-  for (let i = 0; i < m; i++) {
-    if (!s1Matches[i]) continue;
-    while (!s2Matches[k]) k++;
-    if (s1[i] !== s2[k]) transpositions++;
-    k++;
-  }
-  
-  const jaro = (matches / m + matches / n + (matches - transpositions / 2) / matches) / 3;
-  
-  let prefix = 0;
-  for (let i = 0; i < Math.min(m, n, 4); i++) {
-    if (s1[i] === s2[i]) prefix++;
-    else break;
-  }
-  
-  return jaro + prefix * 0.1 * (1 - jaro);
-}
-
-// Normalize text
-function normalize(text) {
-  return text.trim().replace(/\s+/g, ' ');
+// Calculate cosine similarity between two vectors
+function cosineSimilarity(vecA, vecB) {
+  const dotProduct = vecA.reduce((sum, a, i) => sum + a * vecB[i], 0);
+  const magnitudeA = Math.sqrt(vecA.reduce((sum, a) => sum + a * a, 0));
+  const magnitudeB = Math.sqrt(vecB.reduce((sum, b) => sum + b * b, 0));
+  return dotProduct / (magnitudeA * magnitudeB);
 }
 
 // Health check endpoint
 app.get('/', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    message: 'Answer Comparison API',
-    modelLoaded: extractor !== null
+  res.json({
+    status: 'ok',
+    message: 'Universal Sentence Encoder API is running',
+    modelLoaded: model !== null
   });
 });
 
-// Compare endpoint
-app.post('/api/compare', async (req, res) => {
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    modelLoaded: model !== null
+  });
+});
+
+// Similarity endpoint
+app.post('/similarity', async (req, res) => {
   try {
-    const { userAnswer, correctAnswer, threshold = 0.75 } = req.body;
+    const { text1, text2 } = req.body;
     
-    if (!userAnswer || !correctAnswer) {
-      return res.status(400).json({ 
-        error: 'Both userAnswer and correctAnswer are required' 
+    // Validate input
+    if (!text1 || !text2) {
+      return res.status(400).json({
+        error: 'Both text1 and text2 are required'
       });
     }
     
-    const normalizedUser = normalize(userAnswer);
-    const normalizedCorrect = normalize(correctAnswer);
-    
-    // Exact match check
-    if (normalizedUser.toLowerCase() === normalizedCorrect.toLowerCase()) {
-      return res.json({
-        isCorrect: true,
-        confidence: 1.0,
-        scores: {
-          exact: 1.0,
-          semantic: 1.0,
-          jaroWinkler: 1.0,
-          combined: 1.0
-        }
+    if (typeof text1 !== 'string' || typeof text2 !== 'string') {
+      return res.status(400).json({
+        error: 'text1 and text2 must be strings'
       });
     }
     
-    // Get the model
-    const model = await getExtractor();
+    // Ensure model is loaded
+    const loadedModel = await loadModel();
     
-    // Get embeddings
-    const output = await model([normalizedUser, normalizedCorrect], {
-      pooling: 'mean',
-      normalize: true
-    });
+    // Generate embeddings
+    const embeddings = await loadedModel.embed([text1, text2]);
+    const embeddingsArray = await embeddings.array();
     
-    // Calculate cosine similarity
-    const similarity = cos_sim(output[0].data, output[1].data);
-    const semanticScore = Number(similarity);
+    // Calculate similarity
+    const similarity = cosineSimilarity(embeddingsArray[0], embeddingsArray[1]);
     
-    // Calculate Jaro-Winkler similarity
-    const jaroScore = jaroWinkler(
-      normalizedUser.toLowerCase(), 
-      normalizedCorrect.toLowerCase()
-    );
-    
-    // Weighted combination: 80% semantic, 20% Jaro-Winkler
-    const combinedScore = semanticScore * 0.8 + jaroScore * 0.2;
-    
-    const isCorrect = combinedScore >= threshold;
+    // Clean up tensors to prevent memory leaks
+    embeddings.dispose();
     
     res.json({
-      isCorrect,
-      confidence: combinedScore,
-      scores: {
-        semantic: semanticScore,
-        jaroWinkler: jaroScore,
-        combined: combinedScore
-      },
-      threshold
+      text1,
+      text2,
+      similarity: similarity,
+      similarityPercentage: `${(similarity * 100).toFixed(2)}%`
     });
     
   } catch (error) {
-    console.error('Error processing request:', error);
-    res.status(500).json({ 
-      error: 'Internal server error',
+    console.error('Error calculating similarity:', error);
+    res.status(500).json({
+      error: 'Failed to calculate similarity',
       message: error.message
     });
   }
 });
 
-// Start server
-app.listen(PORT, async () => {
-  console.log(`Server running on port ${PORT}`);
-  // Pre-load model on startup
-  await getExtractor();
-  console.log('Ready to accept requests!');
+// Batch similarity endpoint - compare one text against multiple texts
+app.post('/similarity/batch', async (req, res) => {
+  try {
+    const { text, texts } = req.body;
+    
+    // Validate input
+    if (!text || !texts) {
+      return res.status(400).json({
+        error: 'Both text and texts array are required'
+      });
+    }
+    
+    if (!Array.isArray(texts)) {
+      return res.status(400).json({
+        error: 'texts must be an array'
+      });
+    }
+    
+    // Ensure model is loaded
+    const loadedModel = await loadModel();
+    
+    // Generate embeddings for all texts
+    const allTexts = [text, ...texts];
+    const embeddings = await loadedModel.embed(allTexts);
+    const embeddingsArray = await embeddings.array();
+    
+    // Calculate similarities
+    const baseEmbedding = embeddingsArray[0];
+    const similarities = texts.map((comparisonText, index) => {
+      const similarity = cosineSimilarity(baseEmbedding, embeddingsArray[index + 1]);
+      return {
+        text: comparisonText,
+        similarity: similarity,
+        similarityPercentage: `${(similarity * 100).toFixed(2)}%`
+      };
+    });
+    
+    // Clean up tensors
+    embeddings.dispose();
+    
+    res.json({
+      baseText: text,
+      results: similarities
+    });
+    
+  } catch (error) {
+    console.error('Error calculating batch similarity:', error);
+    res.status(500).json({
+      error: 'Failed to calculate batch similarity',
+      message: error.message
+    });
+  }
 });
+
+// Start the server and load the model
+async function startServer() {
+  try {
+    // Pre-load the model before accepting requests
+    await loadModel();
+    
+    app.listen(PORT, () => {
+      console.log(`Server is running on port ${PORT}`);
+      console.log(`Health check: http://localhost:${PORT}/health`);
+      console.log(`Similarity endpoint: POST http://localhost:${PORT}/similarity`);
+    });
+  } catch (error) {
+    console.error('Failed to start server:', error);
+    process.exit(1);
+  }
+}
+
+startServer();
