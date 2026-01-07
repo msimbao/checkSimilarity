@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-require('@tensorflow/tfjs-node');  // This MUST come first!
+require('@tensorflow/tfjs');  // This MUST come first!
 const use = require('@tensorflow-models/universal-sentence-encoder');
 
 
