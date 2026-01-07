@@ -1,6 +1,8 @@
 const express = require('express');
 const cors = require('cors');
+require('@tensorflow/tfjs-node');  // This MUST come first!
 const use = require('@tensorflow-models/universal-sentence-encoder');
+
 
 const app = express();
 const PORT = process.env.PORT || 3000;
